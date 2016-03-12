@@ -16,7 +16,7 @@ use POSIX;
 use Getopt::Std;
 use Storable 'dclone';
 
-use lib '../cfg';
+use lib '../../cfg';
 use EbayConfig;
 
 
@@ -189,15 +189,14 @@ else {
 		|| die "\n\nDatabase connection not made: $DBI::errstr\n\n";
 	};
 
-	die "$@"
-		if ($@);
+	die "$@" if ($@);
 
 	# Get all item weights from tty_storageLocation by TITLE
 	$sth = $dbh->prepare( $sql_get_weight ) or die "can't prepare stmt";
 	$sth->execute() or die "can't execute stmt";
 	$items = $sth->fetchall_hashref('id') or die "can't fetch results";						
 
-  # Create title / variation lookup, and ebayitemid lookup
+  # Create title lookup and itemid lookup
   for my $id ( keys %$items ) {
     $itemsid->{ $items->{$id}->{ebayitemid} } = $items->{$id};
     $itemst->{ $items->{$id}->{title} } = $items->{$id};
@@ -208,7 +207,7 @@ else {
 	$sthtv->execute() or die "can't execute stmt";
 	$items = $sthtv->fetchall_hashref('id') or die "can't fetch results";						
 
-  # Create title / variation lookup, and ebayitemid lookup
+  # Create title/variation lookup
   for my $id ( keys %$items ) {
     $itemstv->{ $items->{$id}->{title} }->{ $items->{$id}->{variation} } = $items->{$id};
   }
@@ -222,6 +221,7 @@ my %all_shipping_profiles;
 ################################################################################
 # Get Ebay Flat shipping discount profiles
 ################################################################################
+print "\n\nGetting Flat rate shipping discount profiles...\n";
 $header->remove_header('X-EBAY-API-CALL-NAME');
 $header->push_header('X-EBAY-API-CALL-NAME' => 'GetShippingDiscountProfiles');
 $request = $request_GetShippingDiscountProfiles;
@@ -230,14 +230,17 @@ my $FlatShippingDiscount = $response_hash->{FlatShippingDiscount}->{DiscountProf
 for my $sp ( @{$FlatShippingDiscount} ) {
 	my $key =  sprintf( "%0.2f", $sp->{EachAdditionalAmount} ); 
 
-  # get rid of duplicate dicount profiles, only keep the ones that are in the right format 
+  # get rid of profiles that are not in the right format 
   next if ( $sp->{DiscountProfileName} !~ /add_[0-9.]+_addl/ );
+
+  # fail if we find a duplicate discount profile
   if ( exists $all_shipping_profiles{ "$key" } ) {
     print Dumper($sp);
     print Dumper($all_shipping_profiles{ "$key" });
     die "$key - discount profile already exists";
   }
 
+  # add discount profile to lookup
 	$all_shipping_profiles{ "$key" }->{EachAdditionalAmount} = $sp->{EachAdditionalAmount};
 	$all_shipping_profiles{ "$key" }->{DiscountProfileName} = $sp->{DiscountProfileName};
 	$all_shipping_profiles{ "$key" }->{DiscountProfileID} = $sp->{DiscountProfileID};
@@ -247,6 +250,7 @@ for my $sp ( @{$FlatShippingDiscount} ) {
 ################################################################################
 # GET LIST OF ACTIVE ITEM_ID's *** FROM EBAY ***
 ################################################################################
+print "\n\nGetting Active eBay listing(s)...\n";
 $header->remove_header('X-EBAY-API-CALL-NAME');
 $header->push_header('X-EBAY-API-CALL-NAME' => 'GetMyeBaySelling');
 
@@ -299,40 +303,48 @@ for my $item_id ( @all_items ) {
 	my $title  = $r->{Title};
 
   ################################################################################ 
-  # Must be in database to get COST  (fyi- cost is at the variation level)
+  # MUST be in database to get COST  (fyi- cost is at the variation level)
+  # TODO: Do we really need to skip the record if it's not in the db??? we can still calculate shipping if the weight is on eBay.
 	if ( ! defined $itemsid->{$item_id} ) {
     print $err_fh qq($item_id,$title,"item id not in database"\n);
     next;
   }
 
+  # If listing is found by itemid, but not title, then the database is out fo sync
 	if ( ! defined $itemst->{$title} ) {
     print $err_fh qq($item_id,$title,"title not in database"\n);
     next;
   }
 
   ################################################################################ 
-	# Get weight from database OR from ebay
+	# Get weight from eBay first, else get it from database
 
   # Get weight from Ebay first (if defined and weight is positive)
   my $lbs = defined $r->{ShippingPackageDetails}->{WeightMajor}->{content} ? int($r->{ShippingPackageDetails}->{WeightMajor}->{content}) : 0;
   my $ozs = defined $r->{ShippingPackageDetails}->{WeightMinor}->{content} ? int($r->{ShippingPackageDetails}->{WeightMinor}->{content}) : 0;
   $ozs = ( $lbs * 16 ) + $ozs;
 
-  # Get weight from database
-	if ( ! $ozs && defined $itemst->{$title} && $itemsid->{$item_id} ) {
+  # Get weight from database (if not found on eBay)
+	if ( ! $ozs && defined $items->{$item_id} ) {
 	  $ozs = int($items->{$item_id}->{weight}||'0');
 	}
 
+  # warn if we still can't get a weight
 	if ( ! $ozs ) {
 		print STDERR "\nITEM ID: '$item_id' - TITLE: '$title' -- no weight";
 		print $noweight_fh "\n$item_id,$title";
-		#next; --> NOTE: moved this down by revise item, to give the item the opportunity to fall out also do to not having intl shipping info
+		#next; --> NOTE: moved this down by revise item, to give the item the opportunity 
+    #                to fall out due do to not having intl shipping info
+    #          TODO: what about items that legitamately do not ship internationally?
 	}
 
-	# Get Ebay Shipping info - mailclass/price
+	# Get Ebay DOMESTIC Shipping info - mailclass/price
 	my $spd = $r->{ShippingPackageDetails};
 	my $sd  = $r->{ShippingDetails};
 	my $shipping_details = dclone($sd);
+
+  # TODO: need to loop over variations to get ITEM cost (not shipping cost, shipping cost is calculated by weight)... ???
+  #       ITEM cost is only need for profit calculation. Maybe we don't even need it in this program?
 
 	#
 	## INTERNATIONAL SERVICES
@@ -342,6 +354,7 @@ for my $item_id ( @all_items ) {
 	my $new_cost_row;
 	my $new_cost_ca;
 
+  # IF INTL shipping is defined
 	if ( defined $sd->{InternationalShippingServiceOption} ) { # this is optional
 		# Calculate new rates and add them to $shipping_details
 		$new_cost_row  = 2.49 + (.50 * $ozs);
